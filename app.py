@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import atexit
 import os
 import re
 import subprocess
+from contextlib import nullcontext
 from typing import List, Any, Dict, Optional
 
 import requests
@@ -10,6 +12,23 @@ from flask_cors import CORS
 
 import chromadb
 from chromadb.config import Settings
+
+try:
+    from sigil_sdk import (
+        Client as SigilClient,
+        ClientConfig,
+        EmbeddingResult,
+        EmbeddingStart,
+        GenerationExportConfig,
+        GenerationStart,
+        ModelRef,
+        TokenUsage,
+        assistant_text_message,
+        user_text_message,
+    )
+    _SIGIL_AVAILABLE = True
+except ImportError:
+    _SIGIL_AVAILABLE = False
 
 # ---- Config ----
 
@@ -35,6 +54,54 @@ COLLECTION_NAME = os.environ.get("RAG_COLLECTION", DEFAULT_COLLECTION)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
 EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", DEFAULT_EMBED_MODEL)
 CHAT_MODEL = os.environ.get("RAG_CHAT_MODEL", DEFAULT_CHAT_MODEL)
+
+# ---- Sigil instrumentation (opt-in via env var) ----
+
+SIGIL_ENDPOINT = os.environ.get("SIGIL_GENERATION_EXPORT_ENDPOINT", "")
+
+_sigil_client = None
+if _SIGIL_AVAILABLE and SIGIL_ENDPOINT:
+    OTEL_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    if OTEL_ENDPOINT:
+        from opentelemetry import metrics, trace
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+
+        resource = Resource.create({"service.name": "local-search"})
+        tp = TracerProvider(resource=resource)
+        tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{OTEL_ENDPOINT}/v1/traces")))
+        trace.set_tracer_provider(tp)
+
+        mp = MeterProvider(
+            resource=resource,
+            metric_readers=[PeriodicExportingMetricReader(
+                OTLPMetricExporter(endpoint=f"{OTEL_ENDPOINT}/v1/metrics"),
+                export_interval_millis=5000,
+            )],
+        )
+        metrics.set_meter_provider(mp)
+
+    _sigil_client = SigilClient(
+        ClientConfig(
+            generation_export=GenerationExportConfig(
+                protocol="http",
+                endpoint=SIGIL_ENDPOINT,
+            ),
+        )
+    )
+
+
+def _shutdown_sigil():
+    if _sigil_client is not None:
+        _sigil_client.shutdown()
+
+
+atexit.register(_shutdown_sigil)
 
 # ---- Stopwords & keyword helpers ----
 
@@ -66,36 +133,98 @@ def extract_keywords(q: str) -> List[str]:
 # ---- Ollama helpers ----
 
 def ollama_embed(text: str) -> List[float]:
-    r = requests.post(
-        f"{OLLAMA_URL}/api/embeddings",
-        json={"model": EMBED_MODEL, "prompt": text},
-        timeout=60,
+    ctx = (
+        _sigil_client.start_embedding(
+            EmbeddingStart(
+                agent_name="local-search",
+                agent_version="0.1.0",
+                model=ModelRef(provider="ollama", name=EMBED_MODEL),
+            )
+        )
+        if _sigil_client is not None
+        else nullcontext()
     )
-    r.raise_for_status()
-    js = r.json()
-    if "embedding" in js:
-        return js["embedding"]
-    if "data" in js and js["data"] and "embedding" in js["data"][0]:
-        return js["data"][0]["embedding"]
-    raise RuntimeError(f"Unexpected embeddings response from Ollama: {js}")
+
+    with ctx as rec:
+        try:
+            r = requests.post(
+                f"{OLLAMA_URL}/api/embeddings",
+                json={"model": EMBED_MODEL, "prompt": text},
+                timeout=60,
+            )
+            r.raise_for_status()
+            js = r.json()
+
+            if "embedding" in js:
+                embedding = js["embedding"]
+            elif "data" in js and js["data"] and "embedding" in js["data"][0]:
+                embedding = js["data"][0]["embedding"]
+            else:
+                raise RuntimeError(
+                    f"Unexpected embeddings response from Ollama: {js}"
+                )
+
+            if rec is not None:
+                rec.set_result(
+                    EmbeddingResult(input_count=1, response_model=EMBED_MODEL)
+                )
+
+            return embedding
+        except Exception as exc:
+            if rec is not None:
+                rec.set_call_error(exc)
+            raise
 
 def ollama_generate(prompt: str, temperature: float = 0.2) -> str:
     """
     Uses /api/generate. If your Ollama prefers /api/chat, you can switch implementation.
     """
-    r = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": CHAT_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": temperature},
-        },
-        timeout=180,
+    ctx = (
+        _sigil_client.start_generation(
+            GenerationStart(
+                agent_name="local-search",
+                agent_version="0.1.0",
+                model=ModelRef(provider="ollama", name=CHAT_MODEL),
+                temperature=temperature,
+            )
+        )
+        if _sigil_client is not None
+        else nullcontext()
     )
-    r.raise_for_status()
-    js = r.json()
-    return js.get("response", "")
+
+    with ctx as rec:
+        try:
+            r = requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": CHAT_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": temperature},
+                },
+                timeout=180,
+            )
+            r.raise_for_status()
+            js = r.json()
+            response_text = js.get("response", "")
+
+            if rec is not None:
+                rec.set_result(
+                    input=[user_text_message(prompt)],
+                    output=[assistant_text_message(response_text)],
+                    usage=TokenUsage(
+                        input_tokens=js.get("prompt_eval_count", 0),
+                        output_tokens=js.get("eval_count", 0),
+                    ),
+                    stop_reason=js.get("done_reason", ""),
+                    response_model=js.get("model", ""),
+                )
+
+            return response_text
+        except Exception as exc:
+            if rec is not None:
+                rec.set_call_error(exc)
+            raise
 
 # ---- Chroma client ----
 
@@ -445,6 +574,9 @@ def api_query():
         return jsonify({"error": f"generation failed: {e}"}), 500
 
     sources_payload = build_sources_payload(segments)
+
+    if _sigil_client is not None:
+        _sigil_client.flush()
 
     return jsonify({
         "answer": answer,

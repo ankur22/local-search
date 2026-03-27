@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterable, List, Dict, Optional
 
@@ -21,6 +22,21 @@ from openpyxl import load_workbook
 import chromadb
 from chromadb.config import Settings
 import unicodedata
+
+try:
+    from sigil_sdk import (
+        Client as SigilClient,
+        ClientConfig,
+        EmbeddingResult,
+        EmbeddingStart,
+        GenerationExportConfig,
+        ModelRef,
+    )
+    _SIGIL_AVAILABLE = True
+except ImportError:
+    _SIGIL_AVAILABLE = False
+
+_sigil_client = None
 
 # ------------------------ Config ------------------------
 
@@ -232,18 +248,47 @@ def ollama_embed(
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: int = 60,
 ) -> List[float]:
-    r = requests.post(
-        f"{base_url}/api/embeddings",
-        json={"model": model, "prompt": text},
-        timeout=timeout,
+    ctx = (
+        _sigil_client.start_embedding(
+            EmbeddingStart(
+                agent_name="local-search-indexer",
+                agent_version="0.1.0",
+                model=ModelRef(provider="ollama", name=model),
+            )
+        )
+        if _sigil_client is not None
+        else nullcontext()
     )
-    r.raise_for_status()
-    js = r.json()
-    if "embedding" in js:
-        return js["embedding"]
-    if "data" in js and js["data"] and "embedding" in js["data"][0]:
-        return js["data"][0]["embedding"]
-    raise RuntimeError(f"Unexpected embeddings response from Ollama: {js}")
+
+    with ctx as rec:
+        try:
+            r = requests.post(
+                f"{base_url}/api/embeddings",
+                json={"model": model, "prompt": text},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            js = r.json()
+
+            if "embedding" in js:
+                embedding = js["embedding"]
+            elif "data" in js and js["data"] and "embedding" in js["data"][0]:
+                embedding = js["data"][0]["embedding"]
+            else:
+                raise RuntimeError(
+                    f"Unexpected embeddings response from Ollama: {js}"
+                )
+
+            if rec is not None:
+                rec.set_result(
+                    EmbeddingResult(input_count=1, response_model=model)
+                )
+
+            return embedding
+        except Exception as exc:
+            if rec is not None:
+                rec.set_call_error(exc)
+            raise
 
 # ------------------------ Discovery & IDs ------------------------
 
@@ -540,23 +585,39 @@ def main():
 
     args = ap.parse_args()
 
-    index_path(
-        roots=args.root,
-        db_dir=args.db,
-        collection_name=args.collection,
-        include_exts=args.include_ext,
-        exclude_dirs=args.exclude_dir,
-        max_file_bytes=args.max_file_bytes,
-        use_tokens=args.use_tokens,
-        chunk_chars=args.chunk_chars,
-        overlap_chars=args.overlap_chars,
-        chunk_tokens=args.chunk_tokens,
-        overlap_tokens=args.overlap_tokens,
-        embed_model=args.embed_model,
-        ollama_url=args.ollama_url,
-        refresh_all=args.refresh_all,
-        prune_missing=not args.no_prune_missing,
-    )
+    global _sigil_client
+    sigil_endpoint = os.environ.get("SIGIL_GENERATION_EXPORT_ENDPOINT", "")
+    if _SIGIL_AVAILABLE and sigil_endpoint:
+        _sigil_client = SigilClient(
+            ClientConfig(
+                generation_export=GenerationExportConfig(
+                    protocol="http",
+                    endpoint=sigil_endpoint,
+                ),
+            )
+        )
+
+    try:
+        index_path(
+            roots=args.root,
+            db_dir=args.db,
+            collection_name=args.collection,
+            include_exts=args.include_ext,
+            exclude_dirs=args.exclude_dir,
+            max_file_bytes=args.max_file_bytes,
+            use_tokens=args.use_tokens,
+            chunk_chars=args.chunk_chars,
+            overlap_chars=args.overlap_chars,
+            chunk_tokens=args.chunk_tokens,
+            overlap_tokens=args.overlap_tokens,
+            embed_model=args.embed_model,
+            ollama_url=args.ollama_url,
+            refresh_all=args.refresh_all,
+            prune_missing=not args.no_prune_missing,
+        )
+    finally:
+        if _sigil_client is not None:
+            _sigil_client.shutdown()
 
 if __name__ == "__main__":
     main()

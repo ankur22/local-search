@@ -25,7 +25,7 @@ source .venv/bin/activate
 ### 1.3 Install dependencies
 
 ```bash
-pip install   chromadb   pypdf   python-docx   markdown   beautifulsoup4   tqdm   python-pptx   openpyxl   tiktoken   requests   flask   flask-cors
+pip install -r requirements.txt
 ```
 
 ### 1.4 Install and start Ollama
@@ -156,6 +156,30 @@ http://localhost:8000
 
 Open that URL in your browser.
 
+### 4.1 Running with Sigil observability
+
+To send LLM generation and embedding telemetry to a [Grafana Sigil](https://github.com/grafana/sigil) instance, set the following environment variables:
+
+```bash
+# Required: enables Sigil generation export
+export SIGIL_GENERATION_EXPORT_ENDPOINT=http://localhost:8080/api/v1/generations:export
+
+# Optional: enables OTEL traces and metrics (for dashboard panels)
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+python app.py
+```
+
+When `SIGIL_GENERATION_EXPORT_ENDPOINT` is set and `sigil-sdk` is installed, both `app.py` and `rag_indexer.py` will record:
+
+- **Generation spans** for every LLM call (`ollama_generate`) with input/output messages, token usage, latency, model, and stop reason
+- **Embedding spans** for every embedding call (`ollama_embed`) with model and input count
+- **OTEL metrics** (`gen_ai.client.operation.duration`, `gen_ai.client.token.usage`) when `OTEL_EXPORTER_OTLP_ENDPOINT` is set
+
+When neither variable is set, the app behaves identically to before — zero overhead.
+
+See section 9 below for full Sigil stack setup.
+
 ---
 
 ## 💬 5. Using the Browser UI
@@ -262,7 +286,7 @@ You can tweak in `app.py`:
 cd /path/to/local-search
 python3 -m venv .venv
 source .venv/bin/activate
-pip install chromadb pypdf python-docx markdown beautifulsoup4 tqdm python-pptx openpyxl tiktoken requests flask flask-cors
+pip install -r requirements.txt
 ```
 
 ### Rebuild index
@@ -281,6 +305,86 @@ python app.py
 ```
 
 Then visit `http://localhost:8000`.
+
+---
+
+## 📊 9. Sigil Observability Setup (Optional)
+
+[Grafana Sigil](https://github.com/grafana/sigil) provides an AI observability dashboard for tracking LLM generations, token usage, latency, errors, and conversations.
+
+### 9.1 Start the Sigil stack
+
+Clone and run the Sigil development stack:
+
+```bash
+git clone https://github.com/grafana/sigil.git
+cd sigil
+docker compose --profile core up -d
+```
+
+The first run builds from source and takes several minutes. Once ready:
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| Grafana | http://localhost:3000 | Dashboards + Sigil plugin (login: `admin`/`admin`) |
+| Sigil | http://localhost:8080 | Generation ingest API |
+| Alloy | http://localhost:4318 | OTEL collector (traces + metrics) |
+| Prometheus | http://localhost:9090 | Metrics storage |
+| Tempo | http://localhost:3200 | Trace storage |
+
+### 9.2 Run local-search with Sigil
+
+```bash
+source .venv/bin/activate
+
+SIGIL_GENERATION_EXPORT_ENDPOINT=http://localhost:8080/api/v1/generations:export \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+python app.py
+```
+
+### 9.3 Run the indexer with Sigil
+
+```bash
+SIGIL_GENERATION_EXPORT_ENDPOINT=http://localhost:8080/api/v1/generations:export \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+python rag_indexer.py --root ~/obsidian/work --db ./chroma_db --collection my_corpus \
+  --embed-model mxbai-embed-large --use-tokens --chunk-tokens 256 --overlap-tokens 64
+```
+
+### 9.4 What you'll see in Grafana
+
+Open http://localhost:3000 and navigate to **AI Observability**:
+
+- **Overview**: total requests, latency P95, error rate, token usage, cost
+- **Performance**: generation duration breakdown by agent/model
+- **Usage**: input/output token counts over time
+- **Conversations**: full input/output message explorer
+
+### 9.5 Stop the Sigil stack
+
+```bash
+cd /path/to/sigil
+docker compose --profile core down
+```
+
+### 9.6 Environment variable reference
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SIGIL_GENERATION_EXPORT_ENDPOINT` | Yes (for Sigil) | HTTP endpoint for generation export |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTEL collector for traces + metrics (enables dashboard panels) |
+
+When neither variable is set, the app runs without any instrumentation overhead.
+
+---
+
+## 🧪 10. Running Tests
+
+```bash
+source .venv/bin/activate
+pip install pytest
+python -m pytest test_app_sigil.py test_indexer_sigil.py -v
+```
 
 ---
 
