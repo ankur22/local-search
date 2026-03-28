@@ -588,6 +588,31 @@ def main():
     global _sigil_client
     sigil_endpoint = os.environ.get("SIGIL_GENERATION_EXPORT_ENDPOINT", "")
     if _SIGIL_AVAILABLE and sigil_endpoint:
+        otel_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+        if otel_endpoint:
+            from opentelemetry import metrics, trace
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            from opentelemetry.sdk.resources import Resource
+
+            resource = Resource.create({"service.name": "local-search-indexer"})
+            tp = TracerProvider(resource=resource)
+            tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{otel_endpoint}/v1/traces")))
+            trace.set_tracer_provider(tp)
+
+            mp = MeterProvider(
+                resource=resource,
+                metric_readers=[PeriodicExportingMetricReader(
+                    OTLPMetricExporter(endpoint=f"{otel_endpoint}/v1/metrics"),
+                    export_interval_millis=5000,
+                )],
+            )
+            metrics.set_meter_provider(mp)
+
         _sigil_client = SigilClient(
             ClientConfig(
                 generation_export=GenerationExportConfig(
