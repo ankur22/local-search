@@ -31,13 +31,13 @@ def _import_app():
 
 
 def _ollama_generate_response(text="Hello world", model="llama3.1"):
+    # OpenAI-compatible /v1/chat/completions shape: ollama_generate now routes
+    # through chat_completion over that API for all providers (ollama/openai/anthropic).
     return {
         "model": model,
-        "response": text,
-        "done": True,
-        "done_reason": "stop",
-        "prompt_eval_count": 42,
-        "eval_count": 15,
+        "choices": [{"message": {"role": "assistant", "content": text},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 42, "completion_tokens": 15},
     }
 
 
@@ -77,7 +77,7 @@ class TestOllamaGenerateWithSigil:
         app.ollama_generate("What is 2+2?", temperature=0.5)
 
         start = fake_start_gen.captured_start
-        assert start.model.provider == "ollama"
+        assert start.model.provider == app.CHAT_PROVIDER
         assert start.model.name == app.CHAT_MODEL
         assert start.agent_name == "local-search"
 
