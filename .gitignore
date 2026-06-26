@@ -1,2 +1,9 @@
 chroma_db/
 .venv/
+demo_chroma/
+__pycache__/
+
+# Local secrets
+.env
+.env.*
+!.env.example
